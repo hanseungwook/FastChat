@@ -1107,14 +1107,25 @@ register_conv_template(
 # llama2 template
 # reference: https://huggingface.co/blog/codellama#conversational-instructions
 # reference: https://github.com/facebookresearch/llama/blob/1a240688810f8036049e8da36b073f63d2ac552c/llama/generation.py#L212
+# register_conv_template(
+#     Conversation(
+#         name="llama-2",
+#         system_template="[INST] <<SYS>>\n{system_message}\n<</SYS>>\n\n",
+#         roles=("[INST]", "[/INST]"),
+#         sep_style=SeparatorStyle.LLAMA2,
+#         sep=" ",
+#         sep2=" </s><s>",
+#     )
+# )
+
+# Overriding llama 2 template with Anthropic HH format
 register_conv_template(
     Conversation(
         name="llama-2",
-        system_template="[INST] <<SYS>>\n{system_message}\n<</SYS>>\n\n",
-        roles=("[INST]", "[/INST]"),
-        sep_style=SeparatorStyle.LLAMA2,
+        system_message="",
+        roles=("Human", "Assistant"),
+        sep_style=SeparatorStyle.ADD_COLON_SPACE_SINGLE,
         sep=" ",
-        sep2=" </s><s>",
     )
 )
 

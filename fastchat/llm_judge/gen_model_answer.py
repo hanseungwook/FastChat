@@ -8,14 +8,22 @@ import json
 import os
 import random
 import time
+from copy import deepcopy
 
 import shortuuid
 import torch
 from tqdm import tqdm
+from transformers import HfArgumentParser, LogitsProcessorList
+from accelerate import Accelerator
 
 from fastchat.llm_judge.common import load_questions, temperature_config
 from fastchat.model import load_model, get_conversation_template
 from fastchat.utils import str_to_torch_dtype
+
+from qlignment.models.model_factory import create_causal_lm_hf_model, create_model
+from qlignment.models.tokenizer_factory import create_tokenizer
+from qlignment.inference.logits_processors import create_logits_processor
+from qlignment.inference.decode_arguments import ModelArguments, InferenceArguments
 
 
 def run_eval(
@@ -32,6 +40,8 @@ def run_eval(
     max_gpu_memory,
     dtype,
     revision,
+    model_args,
+    inference_args,
 ):
     questions = load_questions(question_file, question_begin, question_end)
     # random shuffle the questions to balance the loading
@@ -63,6 +73,8 @@ def run_eval(
                 max_gpu_memory,
                 dtype=dtype,
                 revision=revision,
+                model_args=model_args,
+                inference_args=inference_args,
             )
         )
 
@@ -82,18 +94,55 @@ def get_model_answers(
     max_gpu_memory,
     dtype,
     revision,
+    model_args,
+    inference_args,
 ):
-    model, tokenizer = load_model(
-        model_path,
-        revision=revision,
-        device="cuda",
-        num_gpus=num_gpus_per_model,
-        max_gpu_memory=max_gpu_memory,
-        dtype=dtype,
-        load_8bit=False,
-        cpu_offloading=False,
-        debug=False,
-    )
+    # override creating model and tokenizer
+    model_args.mixed_precision = 'bf16' if dtype == torch.bfloat16 else 'fp16'
+    model = create_causal_lm_hf_model(model_args, is_trainable=False)
+    tokenizer = create_tokenizer(model_args, padding_side='left', padding='longest')
+    accelerator = Accelerator(mixed_precision='bf16' if dtype == torch.bfloat16 else 'fp16')
+    model = accelerator.prepare(model)
+    model.eval()
+    
+    logits_processor = None
+    augment_models = []
+    if model_args.v_model_name_or_path is not None:
+        for cur_v_model_pretrained_lora_weights in model_args.v_model_pretrained_lora_weights:
+            print('Creating v model and logits processor')
+            v_model_args = deepcopy(model_args)
+            v_model_args.model_name_or_path = model_args.v_model_name_or_path
+            v_model_args.model_pretrained_lora_weights = cur_v_model_pretrained_lora_weights
+            v_model_args.use_lora = model_args.v_use_lora
+            v_model_args.load_in_4bit = model_args.v_load_in_4bit
+            v_model_args.load_in_8bit = model_args.v_load_in_8bit
+            augment_model = create_model('value', v_model_args, load_v_head=True, v_head_dir=cur_v_model_pretrained_lora_weights, is_trainable=False)
+            augment_model.base_model = accelerator.prepare(augment_model.base_model)
+            augment_model.value_head = accelerator.prepare(augment_model.value_head)
+            augment_models.append(augment_model)
+            augment_tokenizer = create_tokenizer(v_model_args)
+
+            # eval mode
+            for m in augment_models:
+                m.eval()
+            # instantiate logits processor
+            logits_processor = create_logits_processor(augment_models, inference_args, [tokenizer, augment_tokenizer])
+
+        if logits_processor is not None:
+            for m in augment_models:
+                m.set_tokenizer(augment_tokenizer)
+    
+    # model, tokenizer = load_model(
+    #     model_path,
+    #     revision=revision,
+    #     device="cuda",
+    #     num_gpus=num_gpus_per_model,
+    #     max_gpu_memory=max_gpu_memory,
+    #     dtype=dtype,
+    #     load_8bit=False,
+    #     cpu_offloading=False,
+    #     debug=False,
+    # )
 
     for question in tqdm(questions):
         if question["category"] in temperature_config:
@@ -111,7 +160,9 @@ def get_model_answers(
                 conv.append_message(conv.roles[0], qs)
                 conv.append_message(conv.roles[1], None)
                 prompt = conv.get_prompt()
+
                 input_ids = tokenizer([prompt]).input_ids
+                input_ids = [input_ids[0][:-1]]
 
                 if temperature < 1e-4:
                     do_sample = False
@@ -119,12 +170,14 @@ def get_model_answers(
                     do_sample = True
 
                 # some models may error out when generating long outputs
+
                 try:
                     output_ids = model.generate(
-                        torch.as_tensor(input_ids).cuda(),
+                        inputs=torch.as_tensor(input_ids).cuda(),
                         do_sample=do_sample,
                         temperature=temperature,
                         max_new_tokens=max_new_token,
+                        logits_processor=LogitsProcessorList([logits_processor]) if logits_processor else None
                     )
                     if model.config.is_encoder_decoder:
                         output_ids = output_ids[0]
@@ -270,7 +323,11 @@ if __name__ == "__main__":
         help="The model revision to load.",
     )
 
-    args = parser.parse_args()
+    args, remaining_argv = parser.parse_known_args()
+    
+    hf_parser = HfArgumentParser((ModelArguments, InferenceArguments))
+    model_args, inference_args = hf_parser.parse_args_into_dataclasses(remaining_argv)
+    model_args.mixed_precision = "bf16" if args.dtype == "bfloat16" else "fp16"
 
     if args.num_gpus_total // args.num_gpus_per_model > 1:
         import ray
@@ -299,6 +356,8 @@ if __name__ == "__main__":
         max_gpu_memory=args.max_gpu_memory,
         dtype=str_to_torch_dtype(args.dtype),
         revision=args.revision,
+        model_args=model_args,
+        inference_args=inference_args,
     )
 
     reorg_answer_file(answer_file)
